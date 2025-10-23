@@ -13,6 +13,9 @@
 (define-constant ERR-INACTIVE-SCHOLARSHIP (err u106))
 (define-constant ERR-INVALID-AMOUNT (err u107))
 (define-constant ERR-UNAUTHORIZED (err u108))
+(define-constant ERR-MILESTONE-NOT-FOUND (err u109))
+(define-constant ERR-MILESTONE-ALREADY-CLAIMED (err u110))
+(define-constant ERR-NO-MILESTONES (err u111))
 
 (define-data-var contract-balance uint u0)
 (define-data-var next-scholarship-id uint u1)
@@ -61,6 +64,28 @@
 (define-map scholarship-admins
   { admin: principal, scholarship-id: uint }
   { authorized: bool })
+
+(define-map scholarship-milestones
+  { scholarship-id: uint, milestone-index: uint }
+  {
+    gpa-requirement: uint,
+    credit-hours-requirement: uint,
+    payout-percentage: uint,
+    description: (string-ascii 128),
+    active: bool
+  })
+
+(define-map student-milestone-claims
+  { student-id: uint, scholarship-id: uint, milestone-index: uint }
+  {
+    claimed: bool,
+    claim-block: (optional uint),
+    amount-received: uint
+  })
+
+(define-map scholarship-milestone-count
+  { scholarship-id: uint }
+  { total-milestones: uint })
 
 (define-public (create-scholarship (name (string-ascii 64)) (amount uint) (gpa-requirement uint) (credit-hours-requirement uint) (deadline-block uint))
   (let
@@ -266,3 +291,81 @@
 
 (define-read-only (is-scholarship-admin (admin principal) (scholarship-id uint))
   (default-to false (get authorized (map-get? scholarship-admins { admin: admin, scholarship-id: scholarship-id }))))
+
+(define-public (add-scholarship-milestone (scholarship-id uint) (milestone-index uint) (gpa-requirement uint) (credit-hours-requirement uint) (payout-percentage uint) (description (string-ascii 128)))
+  (let
+    (
+      (scholarship (unwrap! (map-get? scholarships { scholarship-id: scholarship-id }) ERR-NOT-FOUND))
+      (is-admin (default-to false (get authorized (map-get? scholarship-admins { admin: tx-sender, scholarship-id: scholarship-id }))))
+      (current-count (default-to { total-milestones: u0 } (map-get? scholarship-milestone-count { scholarship-id: scholarship-id })))
+    )
+    (asserts! (or (is-eq tx-sender (get admin scholarship)) is-admin) ERR-UNAUTHORIZED)
+    (asserts! (<= payout-percentage u100) ERR-INVALID-AMOUNT)
+    (map-set scholarship-milestones
+      { scholarship-id: scholarship-id, milestone-index: milestone-index }
+      {
+        gpa-requirement: gpa-requirement,
+        credit-hours-requirement: credit-hours-requirement,
+        payout-percentage: payout-percentage,
+        description: description,
+        active: true
+      })
+    (map-set scholarship-milestone-count
+      { scholarship-id: scholarship-id }
+      { total-milestones: (if (> milestone-index (get total-milestones current-count)) milestone-index (get total-milestones current-count)) })
+    (ok true)))
+
+(define-public (claim-milestone (student-id uint) (scholarship-id uint) (milestone-index uint))
+  (let
+    (
+      (student (unwrap! (map-get? students { student-id: student-id }) ERR-NOT-FOUND))
+      (scholarship (unwrap! (map-get? scholarships { scholarship-id: scholarship-id }) ERR-NOT-FOUND))
+      (milestone (unwrap! (map-get? scholarship-milestones { scholarship-id: scholarship-id, milestone-index: milestone-index }) ERR-MILESTONE-NOT-FOUND))
+      (application (unwrap! (map-get? student-scholarships { student-id: student-id, scholarship-id: scholarship-id }) ERR-NOT-FOUND))
+      (existing-claim (map-get? student-milestone-claims { student-id: student-id, scholarship-id: scholarship-id, milestone-index: milestone-index }))
+      (payout-amount (/ (* (get amount scholarship) (get payout-percentage milestone)) u100))
+    )
+    (asserts! (is-eq tx-sender (get wallet student)) ERR-UNAUTHORIZED)
+    (asserts! (get active scholarship) ERR-INACTIVE-SCHOLARSHIP)
+    (asserts! (get active milestone) ERR-MILESTONE-NOT-FOUND)
+    (asserts! (is-none existing-claim) ERR-MILESTONE-ALREADY-CLAIMED)
+    (asserts! (>= (get current-gpa student) (get gpa-requirement milestone)) ERR-REQUIREMENTS-NOT-MET)
+    (asserts! (>= (get completed-credit-hours student) (get credit-hours-requirement milestone)) ERR-REQUIREMENTS-NOT-MET)
+    (asserts! (>= (var-get contract-balance) payout-amount) ERR-INSUFFICIENT-FUNDS)
+    (try! (stx-transfer? payout-amount (as-contract tx-sender) (get wallet student)))
+    (var-set contract-balance (- (var-get contract-balance) payout-amount))
+    (map-set student-milestone-claims
+      { student-id: student-id, scholarship-id: scholarship-id, milestone-index: milestone-index }
+      {
+        claimed: true,
+        claim-block: (some stacks-block-height),
+        amount-received: payout-amount
+      })
+    (map-set scholarships
+      { scholarship-id: scholarship-id }
+      (merge scholarship {
+        total-allocated: (+ (get total-allocated scholarship) payout-amount)
+      }))
+    (ok payout-amount)))
+
+(define-read-only (get-milestone (scholarship-id uint) (milestone-index uint))
+  (map-get? scholarship-milestones { scholarship-id: scholarship-id, milestone-index: milestone-index }))
+
+(define-read-only (get-milestone-claim (student-id uint) (scholarship-id uint) (milestone-index uint))
+  (map-get? student-milestone-claims { student-id: student-id, scholarship-id: scholarship-id, milestone-index: milestone-index }))
+
+(define-read-only (get-milestone-count (scholarship-id uint))
+  (default-to { total-milestones: u0 } (map-get? scholarship-milestone-count { scholarship-id: scholarship-id })))
+
+(define-read-only (check-milestone-eligibility (student-id uint) (scholarship-id uint) (milestone-index uint))
+  (match (map-get? students { student-id: student-id })
+    student (match (map-get? scholarship-milestones { scholarship-id: scholarship-id, milestone-index: milestone-index })
+      milestone (ok {
+        meets-gpa: (>= (get current-gpa student) (get gpa-requirement milestone)),
+        meets-credit-hours: (>= (get completed-credit-hours student) (get credit-hours-requirement milestone)),
+        is-verified: (get verified student),
+        milestone-active: (get active milestone),
+        already-claimed: (is-some (map-get? student-milestone-claims { student-id: student-id, scholarship-id: scholarship-id, milestone-index: milestone-index }))
+      })
+      ERR-MILESTONE-NOT-FOUND)
+    ERR-NOT-FOUND))
